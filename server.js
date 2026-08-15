@@ -9,7 +9,7 @@ const mongoose = require('mongoose');
 // Environment Variables
 const env = {
   NODE_ENV: process.env.NODE_ENV || 'production',
-  PORT: process.env.PORT || 1000,
+  PORT: process.env.PORT || 10000,
   BASE_URL: (process.env.BASE_URL || '').replace(/\/$/, ''),
   USER_BOT_TOKEN: process.env.USER_BOT_TOKEN || '',
   ADMIN_BOT_TOKEN: process.env.ADMIN_BOT_TOKEN || '',
@@ -18,7 +18,7 @@ const env = {
   MONGO_URI: process.env.MONGO_URI || '',
   MEM0_API_KEY: process.env.MEM0_API_KEY || '',
   AI_API_KEY: process.env.AI_API_KEY || '',
-  AI_MODEL: process.env.AI_MODEL || 'openai/gpt-4o-mini',
+  AI_MODEL: process.env.AI_MODEL || 'cognitivecomputations/dolphin-mistral-24b-venice-edition',
   AI_BASE_URL: (process.env.AI_BASE_URL || 'https://api.aicredits.in/v1').replace(/\/$/, ''),
   TAVILY_API_KEY: process.env.TAVILY_API_KEY || '',
   NEWSDATA_API_KEY: process.env.NEWSDATA_API_KEY || '',
@@ -195,7 +195,8 @@ async function newsSearch(query) {
 }
 
 // AI Service
-async function generateAIResponse(messages) {
+async function generateAIResponse(messages, modelOverride) {
+  const model = modelOverride || env.AI_MODEL;
   const url = `${env.AI_BASE_URL}/chat/completions`;
   try {
     const controller = new AbortController();
@@ -207,7 +208,7 @@ async function generateAIResponse(messages) {
         Authorization: `Bearer ${env.AI_API_KEY}`,
       },
       body: JSON.stringify({
-        model: env.AI_MODEL,
+        model,
         messages,
         temperature: 0.7,
         max_tokens: 2000,
@@ -326,43 +327,60 @@ async function rateLimit(ctx, next) {
 // User Bot Handlers
 async function processUserMessage(ctx, user, text, isRegenerate = false) {
   const id = user.telegramId;
-  await ctx.telegram.sendChatAction(ctx.chat.id, 'typing');
-
-  const routing = analyzeIntent(text);
-  let memoryContext = '', webContext = '', newsContext = '';
-
-  if (routing.useMemory && env.MEM0_API_KEY) {
-    const mem = await searchMemory(`telegram:${id}`, text);
-    memoryContext = formatResults(mem.results, 'memory');
-    await Usage.updateOne({ userId: id, date: new Date().toISOString().slice(0,10) }, { $inc: { memoryOps: 1 } }, { upsert: true });
-  }
-  if (routing.useWeb && env.TAVILY_API_KEY) {
-    const web = await webSearch(text);
-    webContext = formatResults(web.results, 'web');
-    await Usage.updateOne({ userId: id, date: new Date().toISOString().slice(0,10) }, { $inc: { webSearches: 1 } }, { upsert: true });
-  }
-  if (routing.useNews && env.NEWSDATA_API_KEY) {
-    const news = await newsSearch(text);
-    newsContext = formatResults(news.results, 'news');
-    await Usage.updateOne({ userId: id, date: new Date().toISOString().slice(0,10) }, { $inc: { newsSearches: 1 } }, { upsert: true });
-  }
-
-  const adminPromptSetting = await Setting.findOne({ key: 'systemPrompt' });
-  const adminPrompt = adminPromptSetting?.value || '';
-  const systemPrompt = buildSystemPrompt({ adminPrompt, memoryContext, webContext, newsContext });
-
-  const conv = await Conversation.findOne({ userId: id });
-  const history = conv?.messages.slice(-env.MAX_HISTORY_MESSAGES) || [];
-  const messages = [{ role: 'system', content: systemPrompt }, ...history.map(m => ({ role: m.role, content: m.content })), { role: 'user', content: text }];
-
   try {
-    const answer = await generateAIResponse(messages);
+    await ctx.telegram.sendChatAction(ctx.chat.id, 'typing');
 
-    // Save conversation
-    if (!isRegenerate) {
-      await Conversation.updateOne({ userId: id }, { $push: { messages: { role: 'user', content: text, timestamp: new Date() } } }, { upsert: true });
+    const routing = analyzeIntent(text);
+    let memoryContext = '', webContext = '', newsContext = '';
+
+    if (routing.useMemory && env.MEM0_API_KEY) {
+      const mem = await searchMemory(`telegram:${id}`, text);
+      memoryContext = formatResults(mem.results, 'memory');
     }
-    await Conversation.updateOne({ userId: id }, { $push: { messages: { role: 'assistant', content: answer, timestamp: new Date() } } }, { upsert: true });
+    if (routing.useWeb && env.TAVILY_API_KEY) {
+      const web = await webSearch(text);
+      webContext = formatResults(web.results, 'web');
+    }
+    if (routing.useNews && env.NEWSDATA_API_KEY) {
+      const news = await newsSearch(text);
+      newsContext = formatResults(news.results, 'news');
+    }
+
+    const adminPromptSetting = await Setting.findOne({ key: 'systemPrompt' });
+    const adminPrompt = adminPromptSetting?.value || '';
+    const systemPrompt = buildSystemPrompt({ adminPrompt, memoryContext, webContext, newsContext });
+
+    const conv = await Conversation.findOne({ userId: id });
+    const history = conv?.messages.slice(-env.MAX_HISTORY_MESSAGES) || [];
+    const messages = [{ role: 'system', content: systemPrompt }, ...history.map(m => ({ role: m.role, content: m.content })), { role: 'user', content: text }];
+
+    const modelSetting = await Setting.findOne({ key: 'aiModel' });
+    const answer = await generateAIResponse(messages, modelSetting?.value);
+
+    // Only count usage after successful AI response
+    if (routing.useMemory && env.MEM0_API_KEY) {
+      await Usage.updateOne({ userId: id, date: new Date().toISOString().slice(0,10) }, { $inc: { memoryOps: 1 } }, { upsert: true });
+    }
+    if (routing.useWeb && env.TAVILY_API_KEY) {
+      await Usage.updateOne({ userId: id, date: new Date().toISOString().slice(0,10) }, { $inc: { webSearches: 1 } }, { upsert: true });
+    }
+    if (routing.useNews && env.NEWSDATA_API_KEY) {
+      await Usage.updateOne({ userId: id, date: new Date().toISOString().slice(0,10) }, { $inc: { newsSearches: 1 } }, { upsert: true });
+    }
+
+    // Save conversation with $slice to cap history
+    if (!isRegenerate) {
+      await Conversation.updateOne(
+        { userId: id },
+        { $push: { messages: { $each: [{ role: 'user', content: text, timestamp: new Date() }], $slice: -50 } } },
+        { upsert: true }
+      );
+    }
+    await Conversation.updateOne(
+      { userId: id },
+      { $push: { messages: { $each: [{ role: 'assistant', content: answer, timestamp: new Date() }], $slice: -50 } } },
+      { upsert: true }
+    );
 
     // Save memory if needed
     if (routing.useMemory && env.MEM0_API_KEY) {
@@ -466,6 +484,12 @@ userBot.action(/^(start_chat|settings|help|home|clear_chat|regen)$/, async (ctx)
   }
 });
 
+// Add global userBot error handler
+userBot.catch((err, ctx) => {
+  log('error', 'Unhandled userBot error', { error: err?.message || String(err), userId: ctx?.from?.id });
+  ctx.reply('⚠️ Something went wrong. Please try again.').catch(() => {});
+});
+
 // Admin Bot
 adminBot.use(async (ctx, next) => {
   const id = String(ctx.from?.id || '');
@@ -490,9 +514,8 @@ adminBot.on('text', async (ctx) => {
     return ctx.reply('Broadcast this message?', { reply_markup: { inline_keyboard: [[{ text: '✅ Send', callback_data: 'broadcast_confirm' }, { text: '❌ Cancel', callback_data: 'broadcast_cancel' }]] } });
   }
   if (pending?.type === 'ai_model') {
-    await Setting.updateOne({ key: 'aiModel' }, { value: ctx.message.text, updatedAt: new Date(), updatedBy: id }, { upsert: true });
-    adminPending.delete(id);
-    return ctx.reply(`✅ AI model updated to ${ctx.message.text}`);
+    adminPending.set(id, { type: 'ai_model_confirm', value: ctx.message.text });
+    return ctx.reply(`Set AI model to "${ctx.message.text}"?`, { reply_markup: { inline_keyboard: [[{ text: '✅ Confirm', callback_data: 'aimodel_confirm' }, { text: '❌ Cancel', callback_data: 'aimodel_cancel' }]] } });
   }
   if (pending?.type === 'user_search') {
     adminPending.delete(id);
@@ -530,8 +553,30 @@ adminBot.action('sysprompt_edit', (ctx) => { ctx.answerCbQuery(); adminPending.s
 adminBot.action('sysprompt_reset', async (ctx) => { await ctx.answerCbQuery(); await Setting.updateOne({ key: 'systemPrompt' }, { value: '', updatedAt: new Date(), updatedBy: String(ctx.from.id) }, { upsert: true }); return ctx.reply('♻️ System prompt reset.'); });
 adminBot.action('sysprompt_confirm', async (ctx) => { await ctx.answerCbQuery(); const id = String(ctx.from.id); const pending = adminPending.get(id); if (pending?.value) { await Setting.updateOne({ key: 'systemPrompt' }, { value: pending.value, updatedAt: new Date(), updatedBy: id }, { upsert: true }); adminPending.delete(id); return ctx.reply('✅ System prompt activated.'); } return ctx.reply('No pending prompt.'); });
 adminBot.action('sysprompt_cancel', (ctx) => { ctx.answerCbQuery(); adminPending.delete(String(ctx.from.id)); return ctx.reply('❌ Cancelled.'); });
+adminBot.action('aimodel_confirm', async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = String(ctx.from.id);
+  const pending = adminPending.get(id);
+  if (pending?.value) {
+    await Setting.updateOne({ key: 'aiModel' }, { value: pending.value, updatedAt: new Date(), updatedBy: id }, { upsert: true });
+    adminPending.delete(id);
+    return ctx.reply(`✅ AI model updated to ${pending.value}`);
+  }
+  return ctx.reply('No pending model change.');
+});
+adminBot.action('aimodel_cancel', (ctx) => {
+  ctx.answerCbQuery();
+  adminPending.delete(String(ctx.from.id));
+  return ctx.reply('❌ Cancelled.');
+});
 adminBot.action(/^user_action:(.+):(.+)$/, async (ctx) => { await ctx.answerCbQuery(); const targetId = ctx.match[1]; const action = ctx.match[2]; const target = await User.findOne({ telegramId: targetId }); if (!target) return ctx.reply('User not found.'); if (action === 'ban') { target.banned = true; await target.save(); return ctx.reply(`✅ Banned ${target.firstName}`); } if (action === 'unban') { target.banned = false; await target.save(); return ctx.reply(`✅ Unbanned ${target.firstName}`); } if (action === 'clearmemory') { if (env.MEM0_API_KEY) { try { await fetch(`https://api.mem0.ai/v1/memories/?user_id=${encodeURIComponent(`telegram:${targetId}`)}`, { method: 'DELETE', headers: { Authorization: `Token ${env.MEM0_API_KEY}` } }); } catch {} } return ctx.reply('✅ Memory cleared.'); } if (action === 'resetconversation') { await Conversation.deleteOne({ userId: targetId }); return ctx.reply('✅ Conversation reset.'); } if (action === 'usage') { const today = new Date().toISOString().slice(0,10); const u = await Usage.findOne({ userId: targetId, date: today }); return ctx.reply(`📊 Usage today\n\nAI: ${u?.aiRequests||0}\nWeb: ${u?.webSearches||0}\nNews: ${u?.newsSearches||0}\nMemory: ${u?.memoryOps||0}`); } });
-adminBot.action(/^broadcast_(confirm|cancel)$/, async (ctx) => { await ctx.answerCbQuery(); const id = String(ctx.from.id); const action = ctx.match[1]; if (action === 'cancel') { adminPending.delete(id); return ctx.reply('Broadcast cancelled.'); } const pending = adminPending.get(id); if (!pending?.value) return ctx.reply('No broadcast message.'); adminPending.delete(id); const users = await User.find({ banned: false }); let sent = 0, failed = 0; for (const u of users) { try { await userBot.telegram.sendMessage(u.telegramId, pending.value); sent++; } catch { failed++; } } return ctx.reply(`📢 Broadcast sent: ${sent} OK, ${failed} failed.`); });
+adminBot.action(/^broadcast_(confirm|cancel)$/, async (ctx) => { await ctx.answerCbQuery(); const id = String(ctx.from.id); const action = ctx.match[1]; if (action === 'cancel') { adminPending.delete(id); return ctx.reply('Broadcast cancelled.'); } const pending = adminPending.get(id); if (!pending?.value) return ctx.reply('No broadcast message.'); adminPending.delete(id); const users = await User.find({ banned: false }); let sent = 0, failed = 0; for (const u of users) { try { await userBot.telegram.sendMessage(u.telegramId, pending.value); sent++; } catch { failed++; } await new Promise(resolve => setTimeout(resolve, 50)); } return ctx.reply(`📢 Broadcast sent: ${sent} OK, ${failed} failed.`); });
+
+// Add global adminBot error handler
+adminBot.catch((err, ctx) => {
+  log('error', 'Unhandled adminBot error', { error: err?.message || String(err), userId: ctx?.from?.id });
+  ctx.reply('⚠️ Something went wrong.').catch(() => {});
+});
 
 // Express App
 const app = express();
@@ -539,16 +584,57 @@ app.use(helmet());
 app.use(cors());
 app.use(express.json());
 
-app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
+// Raw request logger for Telegram webhook endpoints (console only, no MongoDB write)
+app.use((req, res, next) => {
+  if (req.method === 'POST' && req.path.startsWith('/telegram/webhook/')) {
+    const token = req.headers['x-telegram-bot-api-secret-token'];
+    const isValid = token === env.TELEGRAM_WEBHOOK_SECRET;
+    console.log({
+      timestamp: new Date().toISOString(),
+      level: 'info',
+      message: 'Webhook request received',
+      meta: {
+        method: req.method,
+        path: req.path,
+        secretTokenPresent: !!token,
+        secretTokenValid: isValid,
+      },
+    });
+  }
+  next();
+});
 
+// GET routes for webhook endpoints (diagnostics)
+app.get('/telegram/webhook/user', (req, res) => {
+  res.status(200).json({ ok: true, note: 'This endpoint only accepts POST from Telegram' });
+});
+
+app.get('/telegram/webhook/admin', (req, res) => {
+  res.status(200).json({ ok: true, note: 'This endpoint only accepts POST from Telegram' });
+});
+
+// Health check with actual DB state
+app.get('/health', (req, res) => {
+  const dbOk = mongoose.connection.readyState === 1;
+  res.status(dbOk ? 200 : 503).json({ status: dbOk ? 'ok' : 'degraded', db: dbOk ? 'connected' : 'disconnected' });
+});
+
+// Webhook auth middleware
 function webhookAuth(req, res, next) {
   const token = req.headers['x-telegram-bot-api-secret-token'];
   if (!token || token !== env.TELEGRAM_WEBHOOK_SECRET) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
-app.post('/telegram/webhook/user', webhookAuth, userBot.webhookCallback('/telegram/webhook/user'));
-app.post('/telegram/webhook/admin', webhookAuth, adminBot.webhookCallback('/telegram/webhook/admin'));
+// Webhook routes: respond immediately, then process async
+app.post('/telegram/webhook/user', webhookAuth, (req, res) => {
+  res.status(200).end();
+  userBot.handleUpdate(req.body).catch(err => log('error', 'userBot handleUpdate failed', { error: err.message }));
+});
+app.post('/telegram/webhook/admin', webhookAuth, (req, res) => {
+  res.status(200).end();
+  adminBot.handleUpdate(req.body).catch(err => log('error', 'adminBot handleUpdate failed', { error: err.message }));
+});
 
 app.use((err, req, res, next) => { log('error', 'Express error', { error: err.message }); res.status(500).json({ error: 'Internal server error' }); });
 
@@ -568,6 +654,23 @@ async function start() {
     await userBot.telegram.setWebhook(`${env.BASE_URL}/telegram/webhook/user`, { secret_token: env.TELEGRAM_WEBHOOK_SECRET, drop_pending_updates: true });
     await adminBot.telegram.setWebhook(`${env.BASE_URL}/telegram/webhook/admin`, { secret_token: env.TELEGRAM_WEBHOOK_SECRET, drop_pending_updates: true });
     log('info', 'Telegram webhooks set');
+
+    // Diagnostics: log webhook info for both bots
+    const userInfo = await userBot.telegram.getWebhookInfo();
+    log('info', 'User bot webhook info', {
+      url: userInfo.url,
+      last_error_message: userInfo.last_error_message,
+      last_error_date: userInfo.last_error_date,
+      pending_update_count: userInfo.pending_update_count,
+    });
+
+    const adminInfo = await adminBot.telegram.getWebhookInfo();
+    log('info', 'Admin bot webhook info', {
+      url: adminInfo.url,
+      last_error_message: adminInfo.last_error_message,
+      last_error_date: adminInfo.last_error_date,
+      pending_update_count: adminInfo.pending_update_count,
+    });
   } catch (err) {
     log('error', 'Webhook setup failed', { error: err.message });
   }
