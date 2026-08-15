@@ -431,9 +431,21 @@ userBot.action(/^(start_chat|settings|help|home|clear_chat|regen)$/, async (ctx)
   await ctx.answerCbQuery();
   const id = String(ctx.from.id);
   const action = ctx.match[1];
+
+  // Maintenance check added
+  const maintenance = await Setting.findOne({ key: 'maintenance' });
+  if (maintenance?.value && !env.ADMIN_IDS.includes(id)) {
+    return ctx.reply('🔧 Ghost GPT is temporarily under maintenance.');
+  }
+
   const user = await User.findOne({ telegramId: id });
   if (!user) {
     return ctx.reply('Please use /start first.');
+  }
+
+  // Banned check added
+  if (user.banned) {
+    return ctx.reply('⛔ You are banned.');
   }
 
   const sendOrEdit = async (text, keyboard) => {
