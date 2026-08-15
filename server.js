@@ -9,7 +9,7 @@ const mongoose = require('mongoose');
 // Environment Variables
 const env = {
   NODE_ENV: process.env.NODE_ENV || 'production',
-  PORT: process.env.PORT || 10000,
+  PORT: process.env.PORT || 1000,
   BASE_URL: (process.env.BASE_URL || '').replace(/\/$/, ''),
   USER_BOT_TOKEN: process.env.USER_BOT_TOKEN || '',
   ADMIN_BOT_TOKEN: process.env.ADMIN_BOT_TOKEN || '',
@@ -202,21 +202,43 @@ async function generateAIResponse(messages) {
     const timeout = setTimeout(() => controller.abort(), 60000);
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.AI_API_KEY}` },
-      body: JSON.stringify({ model: env.AI_MODEL, messages, temperature: 0.7, max_tokens: 2000 }),
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${env.AI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: env.AI_MODEL,
+        messages,
+        temperature: 0.7,
+        max_tokens: 2000,
+      }),
       signal: controller.signal,
     });
     clearTimeout(timeout);
+
     if (!res.ok) {
-      let detail = '';
-      try { detail = await res.text(); } catch {}
-      throw new Error(`AI provider error: ${res.status} ${detail}`.trim());
+      const errorText = await res.text();
+      log('error', 'AI provider request failed', {
+        status: res.status,
+        response: errorText.slice(0, 1000),
+      });
+      throw new Error(`AI provider error: ${res.status} ${errorText.slice(0, 200)}`);
     }
+
     const data = await res.json();
     const content = data?.choices?.[0]?.message?.content;
-    if (!content) throw new Error('No content from AI');
+    if (!content) {
+      throw new Error('No content from AI');
+    }
     return content;
   } catch (err) {
+    if (err.name === 'AbortError') {
+      log('error', 'AI request timed out');
+      throw new Error('AI request timed out');
+    }
+    if (err.message.startsWith('AI provider error')) {
+      throw err; // already logged
+    }
     log('error', 'AI request failed', { error: err.message });
     throw err;
   }
@@ -391,16 +413,56 @@ userBot.action(/^(start_chat|settings|help|home|clear_chat|regen)$/, async (ctx)
   await ctx.answerCbQuery();
   const id = String(ctx.from.id);
   const action = ctx.match[1];
-  if (action === 'start_chat' || action === 'home') return ctx.reply('👻 Ghost GPT\n\nHey! I\'m Ghost GPT. Ask me anything.', { reply_markup: welcomeKeyboard });
-  if (action === 'settings') return ctx.reply('⚙️ Settings', { reply_markup: chatKeyboard });
-  if (action === 'help') return ctx.reply('Just ask me anything!');
-  if (action === 'clear_chat') { await Conversation.deleteOne({ userId: id }); return ctx.reply('🗑️ Conversation cleared.'); }
+  const user = await User.findOne({ telegramId: id });
+  if (!user) {
+    return ctx.reply('Please use /start first.');
+  }
+
+  const sendOrEdit = async (text, keyboard) => {
+    try {
+      if (ctx.callbackQuery?.message) {
+        await ctx.editMessageText(text, { reply_markup: keyboard });
+      } else {
+        await ctx.reply(text, { reply_markup: keyboard });
+      }
+    } catch (err) {
+      // Fallback if edit fails (e.g., message too old)
+      await ctx.reply(text, { reply_markup: keyboard });
+    }
+  };
+
+  if (action === 'start_chat') {
+    return sendOrEdit('💬 Chat Mode\n\nSend me a message and I will reply.', chatKeyboard);
+  }
+
+  if (action === 'home') {
+    return sendOrEdit('👻 Ghost GPT\n\nHey! I\'m Ghost GPT. Ask me anything.', welcomeKeyboard);
+  }
+
+  if (action === 'settings') {
+    return sendOrEdit('⚙️ Settings', chatKeyboard);
+  }
+
+  if (action === 'help') {
+    return sendOrEdit(
+      '👻 Ghost GPT\n\nJust ask me anything. I automatically use the right tools.\n\nCommands:\n/start - Welcome\n/help - Help\n/reset - Clear chat\n/settings - Settings',
+      chatKeyboard
+    );
+  }
+
+  if (action === 'clear_chat') {
+    await Conversation.deleteOne({ userId: id });
+    return sendOrEdit('🗑️ Conversation cleared.', chatKeyboard);
+  }
+
   if (action === 'regen') {
     const conv = await Conversation.findOne({ userId: id });
     const lastUser = [...(conv?.messages || [])].reverse().find(m => m.role === 'user');
-    if (!lastUser) return ctx.reply('Nothing to regenerate.');
-    const user = await User.findOne({ telegramId: id });
-    if (user) await processUserMessage(ctx, user, lastUser.content, true);
+    if (!lastUser) {
+      return sendOrEdit('Nothing to regenerate.', chatKeyboard);
+    }
+    // Process regeneration
+    await processUserMessage(ctx, user, lastUser.content, true);
   }
 });
 
