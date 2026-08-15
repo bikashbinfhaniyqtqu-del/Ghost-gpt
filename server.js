@@ -327,6 +327,7 @@ async function rateLimit(ctx, next) {
 // User Bot Handlers
 async function processUserMessage(ctx, user, text, isRegenerate = false) {
   const id = user.telegramId;
+  console.log('processUserMessage started', { userId: id, text: text.slice(0, 50) });
   try {
     await ctx.telegram.sendChatAction(ctx.chat.id, 'typing');
 
@@ -393,6 +394,7 @@ async function processUserMessage(ctx, user, text, isRegenerate = false) {
     for (let i = 0; i < chunks.length; i++) {
       await ctx.reply(chunks[i], i === 0 ? { reply_markup: chatKeyboard } : {});
     }
+    console.log('Response sent successfully', { userId: id });
   } catch (err) {
     log('error', 'User message processing error', { error: err.message, userId: id });
     await User.updateOne({ telegramId: id }, { $inc: { 'stats.errors': 1 } });
@@ -416,11 +418,38 @@ userBot.command('settings', (ctx) => ctx.reply('⚙️ Settings', { reply_markup
 
 userBot.on('text', async (ctx) => {
   const id = String(ctx.from.id);
+  console.log('Text handler triggered', { userId: id, text: ctx.message.text.slice(0, 50) });
+
   const maintenance = await Setting.findOne({ key: 'maintenance' });
-  if (maintenance?.value && !env.ADMIN_IDS.includes(id)) return ctx.reply('🔧 Ghost GPT is temporarily under maintenance.');
+  if (maintenance?.value && !env.ADMIN_IDS.includes(id)) {
+    return ctx.reply('🔧 Ghost GPT is temporarily under maintenance.');
+  }
+
   let user = await User.findOne({ telegramId: id });
-  if (!user) return ctx.reply('Please use /start first.');
-  if (user.banned) return ctx.reply('⛔ You are banned.');
+  if (!user) {
+    // Auto-register instead of asking /start
+    user = await User.create({
+      telegramId: id,
+      username: ctx.from.username || '',
+      firstName: ctx.from.first_name || '',
+      lastName: ctx.from.last_name || '',
+      isAdmin: env.ADMIN_IDS.includes(id),
+      settings: {},
+      stats: {},
+    });
+    log('info', 'Auto-registered user', { userId: id });
+  } else {
+    user.lastActive = new Date();
+    user.username = ctx.from.username || user.username;
+    user.firstName = ctx.from.first_name || user.firstName;
+    user.lastName = ctx.from.last_name || user.lastName;
+    await user.save();
+  }
+
+  if (user.banned) {
+    return ctx.reply('⛔ You are banned.');
+  }
+
   const text = ctx.message.text.trim();
   if (!text) return;
   return processUserMessage(ctx, user, text);
@@ -432,7 +461,6 @@ userBot.action(/^(start_chat|settings|help|home|clear_chat|regen)$/, async (ctx)
   const id = String(ctx.from.id);
   const action = ctx.match[1];
 
-  // Maintenance check added
   const maintenance = await Setting.findOne({ key: 'maintenance' });
   if (maintenance?.value && !env.ADMIN_IDS.includes(id)) {
     return ctx.reply('🔧 Ghost GPT is temporarily under maintenance.');
@@ -443,7 +471,6 @@ userBot.action(/^(start_chat|settings|help|home|clear_chat|regen)$/, async (ctx)
     return ctx.reply('Please use /start first.');
   }
 
-  // Banned check added
   if (user.banned) {
     return ctx.reply('⛔ You are banned.');
   }
@@ -456,7 +483,6 @@ userBot.action(/^(start_chat|settings|help|home|clear_chat|regen)$/, async (ctx)
         await ctx.reply(text, { reply_markup: keyboard });
       }
     } catch (err) {
-      // Fallback if edit fails (e.g., message too old)
       await ctx.reply(text, { reply_markup: keyboard });
     }
   };
@@ -464,39 +490,30 @@ userBot.action(/^(start_chat|settings|help|home|clear_chat|regen)$/, async (ctx)
   if (action === 'start_chat') {
     return sendOrEdit('💬 Chat Mode\n\nSend me a message and I will reply.', chatKeyboard);
   }
-
   if (action === 'home') {
     return sendOrEdit('👻 Ghost GPT\n\nHey! I\'m Ghost GPT. Ask me anything.', welcomeKeyboard);
   }
-
   if (action === 'settings') {
     return sendOrEdit('⚙️ Settings', chatKeyboard);
   }
-
   if (action === 'help') {
-    return sendOrEdit(
-      '👻 Ghost GPT\n\nJust ask me anything. I automatically use the right tools.\n\nCommands:\n/start - Welcome\n/help - Help\n/reset - Clear chat\n/settings - Settings',
-      chatKeyboard
-    );
+    return sendOrEdit('👻 Ghost GPT\n\nJust ask me anything. I automatically use the right tools.\n\nCommands:\n/start - Welcome\n/help - Help\n/reset - Clear chat\n/settings - Settings', chatKeyboard);
   }
-
   if (action === 'clear_chat') {
     await Conversation.deleteOne({ userId: id });
     return sendOrEdit('🗑️ Conversation cleared.', chatKeyboard);
   }
-
   if (action === 'regen') {
     const conv = await Conversation.findOne({ userId: id });
     const lastUser = [...(conv?.messages || [])].reverse().find(m => m.role === 'user');
     if (!lastUser) {
       return sendOrEdit('Nothing to regenerate.', chatKeyboard);
     }
-    // Process regeneration
     await processUserMessage(ctx, user, lastUser.content, true);
   }
 });
 
-// Add global userBot error handler
+// Global userBot error handler
 userBot.catch((err, ctx) => {
   log('error', 'Unhandled userBot error', { error: err?.message || String(err), userId: ctx?.from?.id });
   ctx.reply('⚠️ Something went wrong. Please try again.').catch(() => {});
@@ -641,10 +658,12 @@ function webhookAuth(req, res, next) {
 // Webhook routes: respond immediately, then process async
 app.post('/telegram/webhook/user', webhookAuth, (req, res) => {
   res.status(200).end();
+  console.log('Update received:', JSON.stringify(req.body).slice(0, 300));
   userBot.handleUpdate(req.body).catch(err => log('error', 'userBot handleUpdate failed', { error: err.message }));
 });
 app.post('/telegram/webhook/admin', webhookAuth, (req, res) => {
   res.status(200).end();
+  console.log('Admin update received:', JSON.stringify(req.body).slice(0, 300));
   adminBot.handleUpdate(req.body).catch(err => log('error', 'adminBot handleUpdate failed', { error: err.message }));
 });
 
@@ -667,7 +686,6 @@ async function start() {
     await adminBot.telegram.setWebhook(`${env.BASE_URL}/telegram/webhook/admin`, { secret_token: env.TELEGRAM_WEBHOOK_SECRET, drop_pending_updates: true });
     log('info', 'Telegram webhooks set');
 
-    // Diagnostics: log webhook info for both bots
     const userInfo = await userBot.telegram.getWebhookInfo();
     log('info', 'User bot webhook info', {
       url: userInfo.url,
