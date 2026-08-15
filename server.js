@@ -18,8 +18,8 @@ const env = {
   MONGO_URI: process.env.MONGO_URI || '',
   MEM0_API_KEY: process.env.MEM0_API_KEY || '',
   AI_API_KEY: process.env.AI_API_KEY || '',
-  AI_MODEL: process.env.AI_MODEL || 'gpt-4o-mini',
-  AI_BASE_URL: (process.env.AI_BASE_URL || 'https://aicredits.in/v1').replace(/\/$/, ''),
+  AI_MODEL: process.env.AI_MODEL || 'openai/gpt-4o-mini',
+  AI_BASE_URL: (process.env.AI_BASE_URL || 'https://api.aicredits.in/v1').replace(/\/$/, ''),
   TAVILY_API_KEY: process.env.TAVILY_API_KEY || '',
   NEWSDATA_API_KEY: process.env.NEWSDATA_API_KEY || '',
   JWT_SECRET: process.env.JWT_SECRET || '',
@@ -207,7 +207,11 @@ async function generateAIResponse(messages) {
       signal: controller.signal,
     });
     clearTimeout(timeout);
-    if (!res.ok) throw new Error(`AI provider error: ${res.status}`);
+    if (!res.ok) {
+      let detail = '';
+      try { detail = await res.text(); } catch {}
+      throw new Error(`AI provider error: ${res.status} ${detail}`.trim());
+    }
     const data = await res.json();
     const content = data?.choices?.[0]?.message?.content;
     if (!content) throw new Error('No content from AI');
