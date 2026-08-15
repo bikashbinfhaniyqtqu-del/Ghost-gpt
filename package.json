@@ -1,11 +1,10 @@
 {
   "name": "ghost-gpt",
   "version": "1.0.0",
-  "description": "Ghost GPT - Production Telegram AI Bot Platform for Render",
-  "main": "src/server.js",
+  "description": "Ghost GPT - Production Telegram AI Bot for Render",
+  "main": "server.js",
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "start": "node server.js"
   },
   "engines": {
     "node": ">=20"
